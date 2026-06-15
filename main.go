@@ -9,31 +9,27 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"io/ioutil"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode"
 )
 
-var (
-	typeFlag     = flag.String("type", "", "comma-separated list of type names; must be set")
-	outputFlag   = flag.String("output", "", "output Go file name; default <type>_wago.go")
-	jsOutputFlag = flag.String("js-output", "", "output JS file name; default <type>.js")
-)
-
 type FieldInfo struct {
-	GoName      string
-	JSName      string
-	GoType      string
-	IsPointer   bool
-	BaseType    string // The type name without pointers, slices, maps
-	IsBasic     bool
-	Kind        FieldKind
-	EltType     string // If slice or map, the element type
-	EltIsBasic  bool
-	EltIsPtr    bool
-	KeyType     string // If map, the key type
+	GoName     string
+	JSName     string
+	GoType     string
+	IsPointer  bool
+	BaseType   string
+	IsBasic    bool
+	Kind       FieldKind
+	EltType    string
+	EltIsBasic bool
+	EltIsPtr   bool
+	KeyType    string
 }
 
 type FieldKind int
@@ -51,31 +47,57 @@ type StructInfo struct {
 }
 
 func main() {
+	// Custom usage output
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "wago is a Go WebAssembly toolchain helper.")
+		fmt.Fprintln(os.Stderr, "\nUsage:")
+		fmt.Fprintln(os.Stderr, "  wago [flags]             generates Go WASM wrappers and ES6 JS classes")
+		fmt.Fprintln(os.Stderr, "  wago build [arguments]   runs generate, compiles WASM binary, and copies wasm_exec.js")
+		fmt.Fprintln(os.Stderr, "\nFlags:")
+		flag.PrintDefaults()
+	}
+
+	// If the subcommand is build, run it
+	if len(os.Args) >= 2 && os.Args[1] == "build" {
+		runBuildCommand(os.Args[2:])
+		return
+	}
+
+	// Otherwise, parse flags for code generation
+	typeFlag := flag.String("type", "", "comma-separated list of type names; must be set")
+	outputFlag := flag.String("output", "", "output Go file name; default <type>_wago.go")
+	jsOutputFlag := flag.String("js-output", "", "output JS file name; default <type>.js")
+
 	flag.Parse()
 
 	if *typeFlag == "" {
-		fmt.Fprintln(os.Stderr, "Error: -type flag is required")
+		if len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help") {
+			flag.Usage()
+			return
+		}
+		fmt.Fprintln(os.Stderr, "Error: -type flag is required for code generation, or use 'build' subcommand")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	types := strings.Split(*typeFlag, ",")
+	runGenCommand(*typeFlag, *outputFlag, *jsOutputFlag)
+}
+
+func runGenCommand(typeStr, outputVal, jsOutputVal string) {
+	types := strings.Split(typeStr, ",")
 	for i := range types {
 		types[i] = strings.TrimSpace(types[i])
 	}
 
-	// Determine working directory
 	dir := "."
 	gofile := os.Getenv("GOFILE")
 	if gofile != "" {
 		dir = filepath.Dir(gofile)
 	}
 
-	// Parse directory
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, dir, func(info os.FileInfo) bool {
 		name := info.Name()
-		// Skip tests, current output files, and subdirectories
 		return !info.IsDir() &&
 			strings.HasSuffix(name, ".go") &&
 			!strings.HasSuffix(name, "_test.go") &&
@@ -87,7 +109,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Find the package name and target structs
 	var pkgName string
 	structs := make(map[string]*StructInfo)
 
@@ -105,14 +126,7 @@ func main() {
 				}
 
 				structName := typeSpec.Name.Name
-				// Check if this struct is one of the requested types
-				requested := false
-				for _, t := range types {
-					if t == structName {
-						requested = true
-						break
-					}
-				}
+				requested := slices.Contains(types, structName)
 				if !requested {
 					return true
 				}
@@ -122,10 +136,8 @@ func main() {
 				}
 
 				for _, field := range structType.Fields.List {
-					// Handle anonymous (embedded) fields
 					names := field.Names
 					if len(names) == 0 {
-						// Embedded field
 						var name string
 						switch t := field.Type.(type) {
 						case *ast.Ident:
@@ -156,7 +168,6 @@ func main() {
 		pkgName = "main"
 	}
 
-	// Verify all requested types were found
 	for _, t := range types {
 		if _, ok := structs[t]; !ok {
 			fmt.Fprintf(os.Stderr, "Error: type %s not found in package %s\n", t, pkgName)
@@ -164,10 +175,9 @@ func main() {
 		}
 	}
 
-	// Determine outputs
 	var goOut, jsOut string
-	if *outputFlag != "" {
-		goOut = *outputFlag
+	if outputVal != "" {
+		goOut = outputVal
 	} else if gofile != "" {
 		ext := filepath.Ext(gofile)
 		base := gofile[:len(gofile)-len(ext)]
@@ -176,8 +186,8 @@ func main() {
 		goOut = strings.ToLower(types[0]) + "_wago.go"
 	}
 
-	if *jsOutputFlag != "" {
-		jsOut = *jsOutputFlag
+	if jsOutputVal != "" {
+		jsOut = jsOutputVal
 	} else if gofile != "" {
 		ext := filepath.Ext(gofile)
 		base := gofile[:len(gofile)-len(ext)]
@@ -186,31 +196,108 @@ func main() {
 		jsOut = strings.ToLower(types[0]) + ".js"
 	}
 
-	// Generate Go Code
 	goCode, err := generateGoCode(pkgName, types, structs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error generating Go code: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Generate JS Code
 	jsCode := generateJSCode(types, structs)
 
-	// Write Go file
-	err = ioutil.WriteFile(goOut, goCode, 0644)
+	err = os.WriteFile(goOut, goCode, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing Go file %s: %v\n", goOut, err)
 		os.Exit(1)
 	}
 	fmt.Printf("Generated Go file: %s\n", goOut)
 
-	// Write JS file
-	err = ioutil.WriteFile(jsOut, []byte(jsCode), 0644)
+	err = os.WriteFile(jsOut, []byte(jsCode), 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing JS file %s: %v\n", jsOut, err)
 		os.Exit(1)
 	}
 	fmt.Printf("Generated JS file: %s\n", jsOut)
+}
+
+func runBuildCommand(args []string) {
+	buildCmd := flag.NewFlagSet("build", flag.ExitOnError)
+	outFlag := buildCmd.String("o", "main.wasm", "output wasm file path")
+	buildCmd.Parse(args)
+
+	outputPath := *outFlag
+	extraArgs := buildCmd.Args()
+
+	fmt.Println("Running go generate ./...")
+	genCmd := exec.Command("go", "generate", "./...")
+	genCmd.Stdout = os.Stdout
+	genCmd.Stderr = os.Stderr
+	if err := genCmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "go generate failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Building Go WASM binary to: %s...\n", outputPath)
+
+	destDir := filepath.Dir(outputPath)
+	if destDir != "" && destDir != "." {
+		if err := os.MkdirAll(destDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating destination directory: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	cmd := exec.Command("go", append([]string{"build", "-o", outputPath}, extraArgs...)...)
+	cmd.Env = append(os.Environ(), "GOOS=js", "GOARCH=wasm")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "go build failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Build succeeded!")
+
+	goroot := os.Getenv("GOROOT")
+	if goroot == "" {
+		out, err := exec.Command("go", "env", "GOROOT").Output()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error querying GOROOT: %v\n", err)
+			os.Exit(1)
+		}
+		goroot = strings.TrimSpace(string(out))
+	}
+
+	wasmExecSrc := filepath.Join(goroot, "lib", "wasm", "wasm_exec.js")
+	if _, err := os.Stat(wasmExecSrc); os.IsNotExist(err) {
+		wasmExecSrc = filepath.Join(goroot, "misc", "wasm", "wasm_exec.js")
+	}
+	wasmExecDst := filepath.Join(destDir, "wasm_exec.js")
+
+	fmt.Printf("Copying wasm_exec.js to: %s...\n", wasmExecDst)
+	if err := copyFile(wasmExecSrc, wasmExecDst); err != nil {
+		fmt.Fprintf(os.Stderr, "Error copying wasm_exec.js: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("wasm_exec.js copied successfully.")
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 func parseField(fset *token.FileSet, fieldName string, expr ast.Expr) FieldInfo {
@@ -219,12 +306,10 @@ func parseField(fset *token.FileSet, fieldName string, expr ast.Expr) FieldInfo 
 		JSName: toCamelCase(fieldName),
 	}
 
-	// Get full Go type string
 	var buf bytes.Buffer
 	printer.Fprint(&buf, fset, expr)
 	info.GoType = buf.String()
 
-	// Parse AST Expr to resolve characteristics
 	resolveType(&info, expr)
 	return info
 }
@@ -241,16 +326,13 @@ func resolveType(info *FieldInfo, expr ast.Expr) {
 		}
 	case *ast.StarExpr:
 		info.IsPointer = true
-		// Resolve the underlying type
 		resolveType(info, t.X)
 	case *ast.ArrayType:
 		info.Kind = KindSlice
-		// Resolve Elt type
 		var eltBuf bytes.Buffer
 		printer.Fprint(&eltBuf, token.NewFileSet(), t.Elt)
 		info.EltType = eltBuf.String()
-		
-		// Check if element is pointer or basic
+
 		underlying := t.Elt
 		if star, ok := underlying.(*ast.StarExpr); ok {
 			info.EltIsPtr = true
@@ -284,7 +366,6 @@ func resolveType(info *FieldInfo, expr ast.Expr) {
 			info.BaseType = info.EltType
 		}
 	default:
-		// Fallback for complex/unknown types
 		info.BaseType = info.GoType
 		info.IsBasic = false
 		info.Kind = KindStruct
@@ -311,18 +392,12 @@ func toCamelCase(s string) string {
 		return s
 	}
 
-	allUpper := true
-	for _, r := range runes {
-		if unicode.IsLower(r) {
-			allUpper = false
-			break
-		}
-	}
+	allUpper := !slices.ContainsFunc(runes, unicode.IsLower)
 	if allUpper {
 		return strings.ToLower(s)
 	}
 
-	for i := 0; i < len(runes); i++ {
+	for i := range runes {
 		if i+1 < len(runes) && unicode.IsUpper(runes[i]) && unicode.IsLower(runes[i+1]) {
 			if i == 0 {
 				runes[0] = unicode.ToLower(runes[0])
@@ -350,7 +425,6 @@ func generateGoCode(pkgName string, types []string, structs map[string]*StructIn
 			continue
 		}
 
-		// ToJSValue method
 		buf.WriteString(fmt.Sprintf("func (u %s) ToJSValue() js.Value {\n", tName))
 		buf.WriteString("\tobj := js.Global().Get(\"Object\").New()\n")
 		for _, f := range st.Fields {
@@ -440,7 +514,6 @@ func generateGoCode(pkgName string, types []string, structs map[string]*StructIn
 		buf.WriteString("\treturn obj\n")
 		buf.WriteString("}\n\n")
 
-		// FromJSValue function
 		buf.WriteString(fmt.Sprintf("func %sFromJSValue(val js.Value) %s {\n", tName, tName))
 		buf.WriteString(fmt.Sprintf("\tvar u %s\n", tName))
 		buf.WriteString("\tif val.IsUndefined() || val.IsNull() {\n\t\treturn u\n\t}\n")
@@ -487,7 +560,6 @@ func generateGoCode(pkgName string, types []string, structs map[string]*StructIn
 				buf.WriteString("\t\t}\n")
 			case KindMap:
 				if f.KeyType != "string" {
-					// Only support string keys for JS compatibility
 					fmt.Fprintf(os.Stderr, "Warning: map key for field %s is not string, skipping deserialization mapping\n", f.GoName)
 				} else {
 					buf.WriteString(fmt.Sprintf("\t\tu.%s = make(%s)\n", f.GoName, f.GoType))
@@ -551,7 +623,6 @@ func generateJSCode(types []string, structs map[string]*StructInfo) string {
 			continue
 		}
 
-		// Constructor JSDoc
 		buf.WriteString("/**\n")
 		for _, f := range st.Fields {
 			jsDocType := getJSDocType(f)
@@ -559,10 +630,8 @@ func generateJSCode(types []string, structs map[string]*StructInfo) string {
 		}
 		buf.WriteString(" */\n")
 
-		// Class Definition
 		buf.WriteString(fmt.Sprintf("export class %s {\n", tName))
 
-		// Constructor
 		buf.WriteString("\t/**\n")
 		for _, f := range st.Fields {
 			jsDocType := getJSDocType(f)
@@ -570,7 +639,6 @@ func generateJSCode(types []string, structs map[string]*StructInfo) string {
 		}
 		buf.WriteString("\t */\n")
 
-		// Constructor parameters
 		var params []string
 		for _, f := range st.Fields {
 			params = append(params, f.JSName)
@@ -581,7 +649,6 @@ func generateJSCode(types []string, structs map[string]*StructInfo) string {
 		}
 		buf.WriteString("\t}\n\n")
 
-		// static fromJS method
 		buf.WriteString("\t/**\n")
 		buf.WriteString("\t * @param {object} obj\n")
 		buf.WriteString(fmt.Sprintf("\t * @returns {%s|null}\n", tName))
@@ -600,7 +667,6 @@ func generateJSCode(types []string, structs map[string]*StructInfo) string {
 		buf.WriteString("\t\t);\n")
 		buf.WriteString("\t}\n\n")
 
-		// toJS method
 		buf.WriteString("\t/**\n")
 		buf.WriteString("\t * @returns {object}\n")
 		buf.WriteString("\t */\n")
