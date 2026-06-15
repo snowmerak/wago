@@ -1,6 +1,6 @@
 package main
 
-//go:generate go run ../main.go -type=User,Profile,Address,Friend
+//go:generate go run ../main.go
 
 type User struct {
 	Name     string
@@ -24,6 +24,11 @@ type Address struct {
 
 type Friend struct {
 	Name string
+}
+
+//wago:export
+func ProcessUser(u User) string {
+	return "Processed: " + u.Name
 }
 
 func main() {}
