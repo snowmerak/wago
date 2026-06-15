@@ -6,7 +6,8 @@
 
 - **Annotated Exports**: Expose Go functions and structs directly to JavaScript using `//wago:export` comments.
 - **Transitive Dependency Resolution**: Any struct referenced by an exported function (in parameters/returns) or nested in another exported struct is automatically resolved and generated without manual configuration.
-- **Type-safe JS Wrappers**: Generates ES6 JS classes and wrapper functions with complete JSDoc annotations for IDE autocompletion.
+- **Auto-generated Entrypoint (`main()`)**: If `wago` detects `package main` but no user-defined `func main()` is present, it automatically generates a `main_wago.go` file containing the Go WASM keep-alive block and exports registration.
+- **Type-safe JS Wrappers**: Generates ES6 JS classes and wrapper functions with complete JSDoc annotations for JS autocompletion.
 - **WASM Build Integration**: `wago build` runs code generation, compiles the binary targeting WebAssembly (`GOOS=js GOARCH=wasm`), and stages compiled binaries, runtime libraries (`wasm_exec.js`), and JS modules under the build folder.
 - **Package Layout Preservation**: Staged JS assets mirror the original Go package directory structure under the output folder.
 
@@ -26,7 +27,7 @@ go build -o wago main.go
 
 ### 1. Annotate Go Code
 
-Add `//wago:export` comments to functions or structs that you want to expose:
+Add `//wago:export` comments to functions or structs that you want to expose. You do not need to write a `main()` function:
 
 ```go
 package main
@@ -51,26 +52,7 @@ func GreetUser(u User) string {
 
 Because `GreetUser` is exported and references `User` (which references `Profile`), both structs will be automatically resolved and generated.
 
-### 2. Register Exports in main()
-
-Call the generated `RegisterWagoExports()` function inside your `main()` entrypoint and block the thread to keep the WASM instance alive:
-
-```go
-package main
-
-import "syscall/js"
-
-func main() {
-	keepAlive := make(chan struct{})
-
-	// Register all annotated wago functions to JS globals
-	RegisterWagoExports()
-
-	<-keepAlive
-}
-```
-
-### 3. Build the Project
+### 2. Build the Project
 
 Run the unified compiler:
 
@@ -78,16 +60,29 @@ Run the unified compiler:
 wago build [-o dist/main.wasm] [extra go build args...]
 ```
 
-By default, output files are generated and staged under the `dist/` directory:
+When building:
+1. `wago` will run `go generate ./...` which triggers generation of Go mappers and JS files.
+2. If the package name is `main` and you have not written a `func main()`, `wago` will automatically generate `main_wago.go` containing:
+   ```go
+   //go:build js && wasm
+   package main
 
-```
-dist/
-├── main.wasm
-├── wasm_exec.js
-└── user_generated.js   (Contains the ES6 class and exported function wrappers)
-```
+   func main() {
+       keepAlive := make(chan struct{})
+       RegisterWagoExports()
+       <-keepAlive
+   }
+   ```
+3. The WebAssembly binary compiles successfully to `dist/main.wasm`.
+4. `wasm_exec.js` is copied and all generated JS modules are staged matching the package layout:
+   ```
+   dist/
+   ├── main.wasm
+   ├── wasm_exec.js
+   └── user_generated.js
+   ```
 
-### 4. JavaScript Integration
+### 3. JavaScript Integration
 
 Import and run the typed ES6 wrapper functions directly in JavaScript:
 
@@ -103,38 +98,26 @@ const greeting = GreetUser(user);
 console.log(greeting); // "Hello Alice"
 ```
 
-## How It Works
+## Custom main() Initialization (Optional)
 
-### Generated Go Bindings (`*_wago.go`)
+If you need custom initialization code (e.g. setting up databases or state in Go before exposing functions), you can write your own `func main()` in Go.
 
-For annotated functions, `wago` generates `RegisterWagoExports()` using `syscall/js`:
+If `wago` detects your `main` function, it will **not** generate `main_wago.go`. You must call `RegisterWagoExports()` manually:
 
 ```go
-func RegisterWagoExports() {
-	js.Global().Set("greetUser", js.FuncOf(func(this js.Value, args []js.Value) any {
-		arg_u := UserFromJSValue(args[0])
-		res := GreetUser(arg_u)
-		return js.ValueOf(res)
-	}))
-}
-```
+package main
 
-### Generated JS Wrappers (`*.js`)
+import "syscall/js"
 
-For the JS frontend, `wago` generates ES6 classes and function wrappers:
+func main() {
+	keepAlive := make(chan struct{})
 
-```javascript
-export class User {
-	// ... constructor and toJS/fromJS helpers
-}
+	// Perform custom setup here...
+	println("Initializing Go WASM module...")
 
-/**
- * @param {User} u
- * @returns {string}
- */
-export function greetUser(u) {
-	const raw_u = u ? u.toJS() : null;
-	const res = globalThis.greetUser(raw_u);
-	return res;
+	// Register all annotated wago functions to JS globals
+	RegisterWagoExports()
+
+	<-keepAlive
 }
 ```

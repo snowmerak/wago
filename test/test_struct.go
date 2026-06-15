@@ -30,5 +30,3 @@ type Friend struct {
 func ProcessUser(u User) string {
 	return "Processed: " + u.Name
 }
-
-func main() {}
