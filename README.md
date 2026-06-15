@@ -157,3 +157,61 @@ export class User {
 	}
 }
 ```
+
+## Exporting Structs to JavaScript
+
+To expose Go struct creation or processing functions to JavaScript, you need to register Go functions in your `main()` entrypoint using `syscall/js` and prevent the Go process from exiting immediately.
+
+### Go Main Registration Example
+
+```go
+package main
+
+import (
+	"syscall/js"
+)
+
+func main() {
+	// Channel to block main goroutine and keep WASM instance alive
+	keepAlive := make(chan struct{})
+
+	// Register a Go function that returns a User to JavaScript
+	js.Global().Set("getUser", js.FuncOf(func(this js.Value, args []js.Value) any {
+		user := User{
+			Name: "Alice",
+			Age:  30,
+		}
+		// Convert Go struct to js.Value using the generated method
+		return user.ToJSValue()
+	}))
+
+	// Register a Go function that receives a JS object and processes it
+	js.Global().Set("processUser", js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 1 {
+			return nil
+		}
+		// Instantiate Go User struct from JS Value using the generated helper
+		user := UserFromJSValue(args[0])
+		println("Hello in Go, name is:", user.Name)
+		return nil
+	}))
+
+	<-keepAlive
+}
+```
+
+### JS Usage Example
+
+Once the WASM module is loaded using the staged `wasm_exec.js` harness:
+
+```javascript
+// Get a User instance from Go WASM
+const rawUser = globalThis.getUser();
+const user = User.fromJS(rawUser);
+console.log(user.name); // "Alice"
+
+// Send a User instance to Go WASM
+const newUser = new User("Bob", 25);
+globalThis.processUser(newUser.toJS());
+```
+
