@@ -5,6 +5,9 @@
 ## Features
 
 - **Annotated Exports**: Expose Go functions and structs directly to JavaScript using `//wago:export` comments.
+- **Async Promise Support**: Mark functions with `//wago:export async` to run Go execution inside a goroutine and seamlessly return a JavaScript `Promise` to prevent blocking the JS event loop. Captured Go panics reject the Promise.
+- **TypedArray Optimization**: Slices of type `[]byte` and `[]uint8` are passed directly as native `Uint8Array`s using optimized binary memory copying (`js.CopyBytesToGo` / `js.CopyBytesToJS`) rather than element-by-element mapping.
+- **Safe Pointer Mapping**: Support for basic pointer types (`*string`, `*int`), struct pointers (`*Address`), pointer slices (`[]*Friend`), and maps containing pointers (`map[string]*int`) with nil/null checks to ensure panic-free serialization and deserialization.
 - **Transitive Dependency Resolution**: Any struct referenced by an exported function (in parameters/returns) or nested in another exported struct is automatically resolved and generated without manual configuration.
 - **Auto-generated Entrypoint (`main()`)**: If `wago` detects `package main` but no user-defined `func main()` is present, it automatically generates a `main_wago.go` file containing the Go WASM keep-alive block and exports registration.
 - **Type-safe JS Wrappers**: Generates ES6 JS classes and wrapper functions with complete JSDoc annotations for JS autocompletion.
@@ -34,23 +37,42 @@ package main
 
 //go:generate wago
 
-type Profile struct {
-	Bio string
+type Friend struct {
+	Name string
 }
 
 type User struct {
-	Name    string
-	Age     int
-	Profile Profile
+	Name       string
+	Age        int
+	BestFriend *Friend
+	AllFriends []*Friend
 }
 
 //wago:export
-func GreetUser(u User) string {
+func ProcessUser(u User) string {
 	return "Hello " + u.Name
+}
+
+//wago:export async
+func FetchUserAsync(id int) (User, error) {
+	// Runs on a Go goroutine and returns a Promise in JS
+	if id < 0 {
+		return User{}, fmt.Errorf("invalid ID")
+	}
+	return User{Name: "Alice", Age: 30}, nil
+}
+
+//wago:export
+func ProcessBytes(data []byte) []byte {
+	// Uses fast TypedArray (Uint8Array) copy
+	for i := range data {
+		data[i] += 1
+	}
+	return data
 }
 ```
 
-Because `GreetUser` is exported and references `User` (which references `Profile`), both structs will be automatically resolved and generated.
+Because `ProcessUser` is exported and references `User` (which references `Friend`), both structs will be automatically resolved and generated.
 
 ### 2. Build the Project
 
@@ -79,7 +101,7 @@ When building:
    dist/
    ├── main.wasm
    ├── wasm_exec.js
-   └── user_generated.js
+   └── test_struct.js
    ```
 
 ### 3. JavaScript Integration
@@ -87,15 +109,25 @@ When building:
 Import and run the typed ES6 wrapper functions directly in JavaScript:
 
 ```javascript
-import { GreetUser, User, Profile } from './dist/user_generated.js';
+import { ProcessUser, FetchUserAsync, ProcessBytes, User, Friend } from './dist/test_struct.js';
 
-// Instantiate classes
-const profile = new Profile("Go WASM Developer");
-const user = new User("Alice", 30, profile);
+// 1. Synchronous struct mapping
+const friend = new Friend("Bob");
+const user = new User("Alice", 30, friend, [friend]);
+console.log(ProcessUser(user)); // "Hello Alice"
 
-// Call Go WASM function seamlessly
-const greeting = GreetUser(user);
-console.log(greeting); // "Hello Alice"
+// 2. Async Promise execution
+try {
+	const resultUser = await FetchUserAsync(42);
+	console.log(resultUser.name); // "Alice"
+} catch (err) {
+	console.error(err);
+}
+
+// 3. Fast Uint8Array passing
+const data = new Uint8Array([1, 2, 3]);
+const modified = ProcessBytes(data);
+console.log(modified); // Uint8Array [2, 3, 4]
 ```
 
 ## Custom main() Initialization (Optional)

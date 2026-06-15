@@ -51,6 +51,7 @@ type ExportedFunc struct {
 	Params   []FieldInfo
 	Results  []FieldInfo
 	HasError bool
+	IsAsync  bool
 }
 
 func main() {
@@ -74,7 +75,6 @@ func main() {
 
 	flag.Parse()
 
-	// If no type flag and no help, we will attempt comment-based detection
 	if *typeFlag == "" && len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "help") {
 		flag.Usage()
 		return
@@ -83,28 +83,32 @@ func main() {
 	runGenCommand(*typeFlag, *outputFlag, *jsOutputFlag)
 }
 
-func parseWagoExport(doc *ast.CommentGroup) (bool, string) {
+func parseWagoExport(doc *ast.CommentGroup) (bool, bool, string) {
 	if doc == nil {
-		return false, ""
+		return false, false, ""
 	}
 	for _, c := range doc.List {
 		text := strings.TrimSpace(c.Text)
 		if strings.HasPrefix(text, "//") {
 			text = strings.TrimSpace(text[2:])
-			if strings.HasPrefix(text, "wago:export") {
-				rem := strings.TrimSpace(text[len("wago:export"):])
-				return true, rem
-			}
 		} else if strings.HasPrefix(text, "/*") {
 			text = text[2 : len(text)-2]
 			text = strings.TrimSpace(text)
-			if strings.HasPrefix(text, "wago:export") {
-				rem := strings.TrimSpace(text[len("wago:export"):])
-				return true, rem
+		} else {
+			continue
+		}
+
+		if strings.HasPrefix(text, "wago:export") {
+			rem := strings.TrimSpace(text[len("wago:export"):])
+			isAsync := false
+			if strings.HasPrefix(rem, "async") {
+				isAsync = true
+				rem = strings.TrimSpace(rem[len("async"):])
 			}
+			return true, isAsync, rem
 		}
 	}
-	return false, ""
+	return false, false, ""
 }
 
 func runGenCommand(typeStr, outputVal, jsOutputVal string) {
@@ -145,13 +149,12 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 	for name, pkg := range pkgs {
 		pkgName = name
 		for _, file := range pkg.Files {
-			// Find annotated functions and structs
 			for _, decl := range file.Decls {
 				if funcDecl, ok := decl.(*ast.FuncDecl); ok {
 					if funcDecl.Recv == nil && funcDecl.Name.Name == "main" {
 						hasUserMain = true
 					}
-					if ok, customName := parseWagoExport(funcDecl.Doc); ok {
+					if ok, isAsync, customName := parseWagoExport(funcDecl.Doc); ok {
 						jsName := customName
 						if jsName == "" {
 							jsName = toCamelCase(funcDecl.Name.Name)
@@ -177,12 +180,21 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 							Params:   params,
 							Results:  results,
 							HasError: hasError,
+							IsAsync:  isAsync,
 						})
 					}
 				}
 
 				if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.TYPE {
-					hasGenExport, genCustomName := parseWagoExport(genDecl.Doc)
+					if ok, _, _ := parseWagoExport(genDecl.Doc); ok {
+						for _, spec := range genDecl.Specs {
+							if typeSpec, ok := spec.(*ast.TypeSpec); ok {
+								if _, ok := typeSpec.Type.(*ast.StructType); ok {
+									annotatedStructs[typeSpec.Name.Name] = true
+								}
+							}
+						}
+					}
 					for _, spec := range genDecl.Specs {
 						typeSpec, ok := spec.(*ast.TypeSpec)
 						if !ok {
@@ -193,7 +205,9 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 							continue
 						}
 						structName := typeSpec.Name.Name
-						hasSpecExport, specCustomName := parseWagoExport(typeSpec.Doc)
+						if ok, _, _ := parseWagoExport(typeSpec.Doc); ok {
+							annotatedStructs[structName] = true
+						}
 
 						stInfo := &StructInfo{
 							Name: structName,
@@ -220,12 +234,6 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 							}
 						}
 						allStructs[structName] = stInfo
-
-						if hasGenExport || hasSpecExport {
-							annotatedStructs[structName] = true
-							_ = genCustomName
-							_ = specCustomName
-						}
 					}
 				}
 			}
@@ -236,7 +244,6 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 		pkgName = "main"
 	}
 
-	// Resolve target structs to generate
 	resolvedStructs := make(map[string]*StructInfo)
 	for name, st := range allStructs {
 		if contains(cliTypes, name) || annotatedStructs[name] {
@@ -244,7 +251,6 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 		}
 	}
 
-	// Transitive dependency resolver
 	for _, fn := range exportedFuncs {
 		for _, p := range fn.Params {
 			resolveDependencies(p, allStructs, resolvedStructs)
@@ -254,7 +260,6 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 		}
 	}
 
-	// Walk fields of resolved structs to find nested structs
 	added := true
 	for added {
 		added = false
@@ -272,18 +277,15 @@ func runGenCommand(typeStr, outputVal, jsOutputVal string) {
 		}
 	}
 
-	// If no structs and no functions are marked, exit
 	if len(resolvedStructs) == 0 && len(exportedFuncs) == 0 {
 		fmt.Fprintln(os.Stderr, "No structs or functions found to generate. Add //wago:export comments or use -type flag.")
 		os.Exit(0)
 	}
 
-	// Sort struct names for deterministic output
 	var structNames []string
 	for name := range resolvedStructs {
 		structNames = append(structNames, name)
 	}
-	// Sort structNames
 	sortStrings(structNames)
 
 	var goOut, jsOut string
@@ -617,10 +619,14 @@ func isBasicType(name string) bool {
 	case "string", "bool",
 		"int", "int8", "int16", "int32", "int64",
 		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
-		"float32", "float64":
+		"float32", "float64", "byte", "rune":
 		return true
 	}
 	return false
+}
+
+func isByteArray(f FieldInfo) bool {
+	return f.Kind == KindSlice && (f.EltType == "byte" || f.EltType == "uint8") && !f.EltIsPtr
 }
 
 func toCamelCase(s string) string {
@@ -664,9 +670,12 @@ func generateGoCode(pkgName string, structNames []string, structs map[string]*St
 	buf.WriteString("//go:build js && wasm\n\n")
 	buf.WriteString("// Code generated by wago; DO NOT EDIT.\n\n")
 	buf.WriteString(fmt.Sprintf("package %s\n\n", pkgName))
-	buf.WriteString("import \"syscall/js\"\n\n")
+	buf.WriteString("import (\n")
+	buf.WriteString("\t\"fmt\"\n")
+	buf.WriteString("\t\"syscall/js\"\n")
+	buf.WriteString(")\n\n")
+	buf.WriteString("var _ = fmt.Sprintf\n\n")
 
-	// Struct mappings
 	for _, tName := range structNames {
 		st := structs[tName]
 		buf.WriteString(fmt.Sprintf("func (u %s) ToJSValue() js.Value {\n", tName))
@@ -694,35 +703,45 @@ func generateGoCode(pkgName string, structNames []string, structs map[string]*St
 					buf.WriteString(fmt.Sprintf("\tobj.Set(\"%s\", u.%s.ToJSValue())\n", f.JSName, f.GoName))
 				}
 			case KindSlice:
-				buf.WriteString(fmt.Sprintf("\tif u.%s != nil {\n", f.GoName))
-				buf.WriteString(fmt.Sprintf("\t\tarr%s := js.Global().Get(\"Array\").New(len(u.%s))\n", f.GoName, f.GoName))
-				buf.WriteString(fmt.Sprintf("\t\tfor i, v := range u.%s {\n", f.GoName))
-				if f.EltIsBasic {
-					if f.EltIsPtr {
-						buf.WriteString("\t\t\tif v != nil {\n")
-						buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, js.ValueOf(*v))\n", f.GoName))
-						buf.WriteString("\t\t\t} else {\n")
-						buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, js.Null())\n", f.GoName))
-						buf.WriteString("\t\t\t}\n")
-					} else {
-						buf.WriteString(fmt.Sprintf("\t\t\tarr%s.SetIndex(i, js.ValueOf(v))\n", f.GoName))
-					}
+				if isByteArray(f) {
+					buf.WriteString(fmt.Sprintf("\tif u.%s != nil {\n", f.GoName))
+					buf.WriteString(fmt.Sprintf("\t\tuint8Array := js.Global().Get(\"Uint8Array\").New(len(u.%s))\n", f.GoName))
+					buf.WriteString(fmt.Sprintf("\t\tjs.CopyBytesToJS(uint8Array, u.%s)\n", f.GoName))
+					buf.WriteString(fmt.Sprintf("\t\tobj.Set(\"%s\", uint8Array)\n", f.JSName))
+					buf.WriteString("\t} else {\n")
+					buf.WriteString(fmt.Sprintf("\t\tobj.Set(\"%s\", js.Null())\n", f.JSName))
+					buf.WriteString("\t}\n")
 				} else {
-					if f.EltIsPtr {
-						buf.WriteString("\t\t\tif v != nil {\n")
-						buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, v.ToJSValue())\n", f.GoName))
-						buf.WriteString("\t\t\t} else {\n")
-						buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, js.Null())\n", f.GoName))
-						buf.WriteString("\t\t\t}\n")
+					buf.WriteString(fmt.Sprintf("\tif u.%s != nil {\n", f.GoName))
+					buf.WriteString(fmt.Sprintf("\t\tarr%s := js.Global().Get(\"Array\").New(len(u.%s))\n", f.GoName, f.GoName))
+					buf.WriteString(fmt.Sprintf("\t\tfor i, v := range u.%s {\n", f.GoName))
+					if f.EltIsBasic {
+						if f.EltIsPtr {
+							buf.WriteString("\t\t\tif v != nil {\n")
+							buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, js.ValueOf(*v))\n", f.GoName))
+							buf.WriteString("\t\t\t} else {\n")
+							buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, js.Null())\n", f.GoName))
+							buf.WriteString("\t\t\t}\n")
+						} else {
+							buf.WriteString(fmt.Sprintf("\t\t\tarr%s.SetIndex(i, js.ValueOf(v))\n", f.GoName))
+						}
 					} else {
-						buf.WriteString(fmt.Sprintf("\t\t\tarr%s.SetIndex(i, v.ToJSValue())\n", f.GoName))
+						if f.EltIsPtr {
+							buf.WriteString("\t\t\tif v != nil {\n")
+							buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, v.ToJSValue())\n", f.GoName))
+							buf.WriteString("\t\t\t} else {\n")
+							buf.WriteString(fmt.Sprintf("\t\t\t\tarr%s.SetIndex(i, js.Null())\n", f.GoName))
+							buf.WriteString("\t\t\t}\n")
+						} else {
+							buf.WriteString(fmt.Sprintf("\t\t\tarr%s.SetIndex(i, v.ToJSValue())\n", f.GoName))
+						}
 					}
+					buf.WriteString("\t\t}\n")
+					buf.WriteString(fmt.Sprintf("\t\tobj.Set(\"%s\", arr%s)\n", f.JSName, f.GoName))
+					buf.WriteString("\t} else {\n")
+					buf.WriteString(fmt.Sprintf("\t\tobj.Set(\"%s\", js.Null())\n", f.JSName))
+					buf.WriteString("\t}\n")
 				}
-				buf.WriteString("\t\t}\n")
-				buf.WriteString(fmt.Sprintf("\t\tobj.Set(\"%s\", arr%s)\n", f.JSName, f.GoName))
-				buf.WriteString("\t} else {\n")
-				buf.WriteString(fmt.Sprintf("\t\tobj.Set(\"%s\", js.Null())\n", f.JSName))
-				buf.WriteString("\t}\n")
 			case KindMap:
 				buf.WriteString(fmt.Sprintf("\tif u.%s != nil {\n", f.GoName))
 				buf.WriteString(fmt.Sprintf("\t\tmap%s := js.Global().Get(\"Object\").New()\n", f.GoName))
@@ -780,28 +799,33 @@ func generateGoCode(pkgName string, structNames []string, structs map[string]*St
 					buf.WriteString(fmt.Sprintf("\t\tu.%s = %sFromJSValue(temp)\n", f.GoName, f.BaseType))
 				}
 			case KindSlice:
-				buf.WriteString(fmt.Sprintf("\t\tu.%s = make(%s, temp.Length())\n", f.GoName, f.GoType))
-				buf.WriteString("\t\tfor i := 0; i < temp.Length(); i++ {\n")
-				buf.WriteString("\t\t\titem := temp.Index(i)\n")
-				buf.WriteString("\t\t\tif !item.IsUndefined() && !item.IsNull() {\n")
-				if f.EltIsBasic {
-					conv := generateGoConv("item", f.BaseType)
-					if f.EltIsPtr {
-						buf.WriteString(fmt.Sprintf("\t\t\t\tvalItem := %s\n", conv))
-						buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = &valItem\n", f.GoName))
-					} else {
-						buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = %s\n", f.GoName, conv))
-					}
+				if isByteArray(f) {
+					buf.WriteString(fmt.Sprintf("\t\tu.%s = make(%s, temp.Length())\n", f.GoName, f.GoType))
+					buf.WriteString(fmt.Sprintf("\t\tjs.CopyBytesToGo(u.%s, temp)\n", f.GoName))
 				} else {
-					if f.EltIsPtr {
-						buf.WriteString(fmt.Sprintf("\t\t\t\tvalItem := %sFromJSValue(item)\n", f.BaseType))
-						buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = &valItem\n", f.GoName))
+					buf.WriteString(fmt.Sprintf("\t\tu.%s = make(%s, temp.Length())\n", f.GoName, f.GoType))
+					buf.WriteString("\t\tfor i := 0; i < temp.Length(); i++ {\n")
+					buf.WriteString("\t\t\titem := temp.Index(i)\n")
+					buf.WriteString("\t\t\tif !item.IsUndefined() && !item.IsNull() {\n")
+					if f.EltIsBasic {
+						conv := generateGoConv("item", f.BaseType)
+						if f.EltIsPtr {
+							buf.WriteString(fmt.Sprintf("\t\t\t\tvalItem := %s\n", conv))
+							buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = &valItem\n", f.GoName))
+						} else {
+							buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = %s\n", f.GoName, conv))
+						}
 					} else {
-						buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = %sFromJSValue(item)\n", f.GoName, f.BaseType))
+						if f.EltIsPtr {
+							buf.WriteString(fmt.Sprintf("\t\t\t\tvalItem := %sFromJSValue(item)\n", f.BaseType))
+							buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = &valItem\n", f.GoName))
+						} else {
+							buf.WriteString(fmt.Sprintf("\t\t\t\tu.%s[i] = %sFromJSValue(item)\n", f.GoName, f.BaseType))
+						}
 					}
+					buf.WriteString("\t\t\t}\n")
+					buf.WriteString("\t\t}\n")
 				}
-				buf.WriteString("\t\t\t}\n")
-				buf.WriteString("\t\t}\n")
 			case KindMap:
 				if f.KeyType != "string" {
 					fmt.Fprintf(os.Stderr, "Warning: map key for field %s is not string, skipping deserialization mapping\n", f.GoName)
@@ -838,26 +862,22 @@ func generateGoCode(pkgName string, structNames []string, structs map[string]*St
 		buf.WriteString("}\n\n")
 	}
 
-	// RegisterWagoExports function
 	if len(exportedFuncs) > 0 {
 		buf.WriteString("func RegisterWagoExports() {\n")
 		for _, fn := range exportedFuncs {
 			buf.WriteString(fmt.Sprintf("\tjs.Global().Set(\"%s\", js.FuncOf(func(this js.Value, args []js.Value) any {\n", fn.JSName))
 
-			// Write parameter deserialization
+			// Parameters conversion (Pre-deserialized synchronously before goroutine)
 			for idx, p := range fn.Params {
 				argName := fmt.Sprintf("arg_%s", p.GoName)
 				switch p.Kind {
 				case KindBasic:
 					conv := generateGoConv(fmt.Sprintf("args[%d]", idx), p.BaseType)
 					if p.IsPointer {
-						buf.WriteString(fmt.Sprintf("\t\tif args[%d].IsNull() || args[%d].IsUndefined() {\n", idx, idx))
-						buf.WriteString(fmt.Sprintf("\t\t\tvar val_%s %s\n", p.GoName, p.BaseType))
-						buf.WriteString(fmt.Sprintf("\t\t\t_ = val_%s\n", p.GoName))
-						buf.WriteString("\t\t} else {\n")
+						buf.WriteString(fmt.Sprintf("\t\tvar %s *%s\n", argName, p.BaseType))
+						buf.WriteString(fmt.Sprintf("\t\tif !args[%d].IsNull() && !args[%d].IsUndefined() {\n", idx, idx))
 						buf.WriteString(fmt.Sprintf("\t\t\tval_%s := %s\n", p.GoName, conv))
-						buf.WriteString(fmt.Sprintf("\t\t\t%s := &val_%s\n", argName, p.GoName))
-						buf.WriteString(fmt.Sprintf("\t\t\t_ = %s\n", argName))
+						buf.WriteString(fmt.Sprintf("\t\t\t%s = &val_%s\n", argName, p.GoName))
 						buf.WriteString("\t\t}\n")
 					} else {
 						buf.WriteString(fmt.Sprintf("\t\t%s := %s\n", argName, conv))
@@ -875,31 +895,39 @@ func generateGoCode(pkgName string, structNames []string, structs map[string]*St
 						buf.WriteString(fmt.Sprintf("\t\t_ = %s\n", argName))
 					}
 				case KindSlice:
-					buf.WriteString(fmt.Sprintf("\t\tvar %s %s\n", argName, p.GoType))
-					buf.WriteString(fmt.Sprintf("\t\tif !args[%d].IsNull() && !args[%d].IsUndefined() {\n", idx, idx))
-					buf.WriteString(fmt.Sprintf("\t\t\t%s = make(%s, args[%d].Length())\n", argName, p.GoType, idx))
-					buf.WriteString(fmt.Sprintf("\t\t\tfor i := 0; i < args[%d].Length(); i++ {\n", idx))
-					buf.WriteString(fmt.Sprintf("\t\t\t\titem := args[%d].Index(i)\n", idx))
-					buf.WriteString("\t\t\t\tif !item.IsUndefined() && !item.IsNull() {\n")
-					if p.EltIsBasic {
-						conv := generateGoConv("item", p.BaseType)
-						if p.EltIsPtr {
-							buf.WriteString(fmt.Sprintf("\t\t\t\t\tvalItem := %s\n", conv))
-							buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = &valItem\n", argName))
-						} else {
-							buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = %s\n", argName, conv))
-						}
+					if isByteArray(p) {
+						buf.WriteString(fmt.Sprintf("\t\tvar %s %s\n", argName, p.GoType))
+						buf.WriteString(fmt.Sprintf("\t\tif !args[%d].IsNull() && !args[%d].IsUndefined() {\n", idx, idx))
+						buf.WriteString(fmt.Sprintf("\t\t\t%s = make(%s, args[%d].Length())\n", argName, p.GoType, idx))
+						buf.WriteString(fmt.Sprintf("\t\t\tjs.CopyBytesToGo(%s, args[%d])\n", argName, idx))
+						buf.WriteString("\t\t}\n")
 					} else {
-						if p.EltIsPtr {
-							buf.WriteString(fmt.Sprintf("\t\t\t\t\tvalItem := %sFromJSValue(item)\n", p.BaseType))
-							buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = &valItem\n", argName))
+						buf.WriteString(fmt.Sprintf("\t\tvar %s %s\n", argName, p.GoType))
+						buf.WriteString(fmt.Sprintf("\t\tif !args[%d].IsNull() && !args[%d].IsUndefined() {\n", idx, idx))
+						buf.WriteString(fmt.Sprintf("\t\t\t%s = make(%s, args[%d].Length())\n", argName, p.GoType, idx))
+						buf.WriteString(fmt.Sprintf("\t\t\tfor i := 0; i < args[%d].Length(); i++ {\n", idx))
+						buf.WriteString(fmt.Sprintf("\t\t\t\titem := args[%d].Index(i)\n", idx))
+						buf.WriteString("\t\t\t\tif !item.IsUndefined() && !item.IsNull() {\n")
+						if p.EltIsBasic {
+							conv := generateGoConv("item", p.BaseType)
+							if p.EltIsPtr {
+								buf.WriteString(fmt.Sprintf("\t\t\t\t\tvalItem := %s\n", conv))
+								buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = &valItem\n", argName))
+							} else {
+								buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = %s\n", argName, conv))
+							}
 						} else {
-							buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = %sFromJSValue(item)\n", argName, p.BaseType))
+							if p.EltIsPtr {
+								buf.WriteString(fmt.Sprintf("\t\t\t\t\tvalItem := %sFromJSValue(item)\n", p.BaseType))
+								buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = &valItem\n", argName))
+							} else {
+								buf.WriteString(fmt.Sprintf("\t\t\t\t\t%s[i] = %sFromJSValue(item)\n", argName, p.BaseType))
+							}
 						}
+						buf.WriteString("\t\t\t\t}\n")
+						buf.WriteString("\t\t\t}\n")
+						buf.WriteString("\t\t}\n")
 					}
-					buf.WriteString("\t\t\t\t}\n")
-					buf.WriteString("\t\t\t}\n")
-					buf.WriteString("\t\t}\n")
 				case KindMap:
 					buf.WriteString(fmt.Sprintf("\t\tvar %s %s\n", argName, p.GoType))
 					buf.WriteString(fmt.Sprintf("\t\tif !args[%d].IsNull() && !args[%d].IsUndefined() {\n", idx, idx))
@@ -931,38 +959,83 @@ func generateGoCode(pkgName string, structNames []string, structs map[string]*St
 				}
 			}
 
-			// Call Go function
+			// Core Function Invocation Code
 			var argCallNames []string
 			for _, p := range fn.Params {
 				argCallNames = append(argCallNames, fmt.Sprintf("arg_%s", p.GoName))
 			}
 			callExpr := fmt.Sprintf("%s(%s)", fn.GoName, strings.Join(argCallNames, ", "))
 
-			if len(fn.Results) == 0 {
-				buf.WriteString(fmt.Sprintf("\t\t%s\n", callExpr))
-				buf.WriteString("\t\treturn nil\n")
-			} else if len(fn.Results) == 1 {
-				if fn.HasError {
-					buf.WriteString(fmt.Sprintf("\t\terr := %s\n", callExpr))
+			if fn.IsAsync {
+				// Promise wrapper
+				buf.WriteString("\t\tpromiseCtor := js.Global().Get(\"Promise\")\n")
+				buf.WriteString("\t\treturn promiseCtor.New(js.FuncOf(func(this js.Value, promiseArgs []js.Value) any {\n")
+				buf.WriteString("\t\t\tresolve := promiseArgs[0]\n")
+				buf.WriteString("\t\t\treject := promiseArgs[1]\n")
+				buf.WriteString("\t\t\tgo func() {\n")
+				buf.WriteString("\t\t\t\tdefer func() {\n")
+				buf.WriteString("\t\t\t\t\tif r := recover(); r != nil {\n")
+				buf.WriteString("\t\t\t\t\t\treject.Invoke(js.Global().Get(\"Error\").New(fmt.Sprintf(\"panic: %v\", r)))\n")
+				buf.WriteString("\t\t\t\t\t}\n")
+				buf.WriteString("\t\t\t\t}()\n")
+
+				if len(fn.Results) == 0 {
+					buf.WriteString(fmt.Sprintf("\t\t\t\t%s\n", callExpr))
+					buf.WriteString("\t\t\t\tresolve.Invoke(js.Undefined())\n")
+				} else if len(fn.Results) == 1 {
+					if fn.HasError {
+						buf.WriteString(fmt.Sprintf("\t\t\t\terr := %s\n", callExpr))
+						buf.WriteString("\t\t\t\tif err != nil {\n")
+						buf.WriteString("\t\t\t\t\treject.Invoke(js.Global().Get(\"Error\").New(err.Error()))\n")
+						buf.WriteString("\t\t\t\t} else {\n")
+						buf.WriteString("\t\t\t\t\tresolve.Invoke(js.Undefined())\n")
+						buf.WriteString("\t\t\t\t}\n")
+					} else {
+						buf.WriteString(fmt.Sprintf("\t\t\t\tres := %s\n", callExpr))
+						buf.WriteString(generateGoToJSAsyncResolve("res", fn.Results[0]))
+					}
+				} else if len(fn.Results) == 2 && fn.HasError {
+					buf.WriteString(fmt.Sprintf("\t\t\t\tres, err := %s\n", callExpr))
+					buf.WriteString("\t\t\t\tif err != nil {\n")
+					buf.WriteString("\t\t\t\t\treject.Invoke(js.Global().Get(\"Error\").New(err.Error()))\n")
+					buf.WriteString("\t\t\t\t} else {\n")
+					buf.WriteString(generateGoToJSAsyncResolve("res", fn.Results[0]))
+					buf.WriteString("\t\t\t\t}\n")
+				} else {
+					buf.WriteString(fmt.Sprintf("\t\t\t\t// Warning: multiple return values are not supported except error\n"))
+					buf.WriteString(fmt.Sprintf("\t\t\t\t%s\n", callExpr))
+					buf.WriteString("\t\t\t\tresolve.Invoke(js.Undefined())\n")
+				}
+				buf.WriteString("\t\t\t}()\n")
+				buf.WriteString("\t\t\treturn nil\n")
+				buf.WriteString("\t\t}))\n")
+			} else {
+				// Synchronous wrapper
+				if len(fn.Results) == 0 {
+					buf.WriteString(fmt.Sprintf("\t\t%s\n", callExpr))
+					buf.WriteString("\t\treturn nil\n")
+				} else if len(fn.Results) == 1 {
+					if fn.HasError {
+						buf.WriteString(fmt.Sprintf("\t\terr := %s\n", callExpr))
+						buf.WriteString("\t\tif err != nil {\n")
+						buf.WriteString("\t\t\treturn js.Global().Get(\"Error\").New(err.Error())\n")
+						buf.WriteString("\t\t}\n")
+						buf.WriteString("\t\treturn nil\n")
+					} else {
+						buf.WriteString(fmt.Sprintf("\t\tres := %s\n", callExpr))
+						buf.WriteString(generateGoToJSReturnValue("res", fn.Results[0]))
+					}
+				} else if len(fn.Results) == 2 && fn.HasError {
+					buf.WriteString(fmt.Sprintf("\t\tres, err := %s\n", callExpr))
 					buf.WriteString("\t\tif err != nil {\n")
 					buf.WriteString("\t\t\treturn js.Global().Get(\"Error\").New(err.Error())\n")
 					buf.WriteString("\t\t}\n")
-					buf.WriteString("\t\treturn nil\n")
-				} else {
-					buf.WriteString(fmt.Sprintf("\t\tres := %s\n", callExpr))
 					buf.WriteString(generateGoToJSReturnValue("res", fn.Results[0]))
+				} else {
+					buf.WriteString("\t\t// Warning: multiple return values are not supported except error\n")
+					buf.WriteString(fmt.Sprintf("\t\t%s\n", callExpr))
+					buf.WriteString("\t\treturn nil\n")
 				}
-			} else if len(fn.Results) == 2 && fn.HasError {
-				buf.WriteString(fmt.Sprintf("\t\tres, err := %s\n", callExpr))
-				buf.WriteString("\t\tif err != nil {\n")
-				buf.WriteString("\t\t\treturn js.Global().Get(\"Error\").New(err.Error())\n")
-				buf.WriteString("\t\t}\n")
-				buf.WriteString(generateGoToJSReturnValue("res", fn.Results[0]))
-			} else {
-				// Unsupported multiple results
-				buf.WriteString("\t\t// Warning: multiple return values are not supported except error\n")
-				buf.WriteString(fmt.Sprintf("\t\t%s\n", callExpr))
-				buf.WriteString("\t\treturn nil\n")
 			}
 
 			buf.WriteString("\t}))\n")
@@ -995,34 +1068,43 @@ func generateGoToJSReturnValue(varName string, r FieldInfo) string {
 			buf.WriteString(fmt.Sprintf("\t\treturn %s.ToJSValue()\n", varName))
 		}
 	case KindSlice:
-		buf.WriteString(fmt.Sprintf("\t\tif %s != nil {\n", varName))
-		buf.WriteString(fmt.Sprintf("\t\t\tarrRes := js.Global().Get(\"Array\").New(len(%s))\n", varName))
-		buf.WriteString(fmt.Sprintf("\t\t\tfor idx, val := range %s {\n", varName))
-		if r.EltIsBasic {
-			if r.EltIsPtr {
-				buf.WriteString("\t\t\t\tif val != nil {\n")
-				buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, js.ValueOf(*val))\n")
-				buf.WriteString("\t\t\t\t} else {\n")
-				buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, js.Null())\n")
-				buf.WriteString("\t\t\t\t}\n")
-			} else {
-				buf.WriteString("\t\t\t\tarrRes.SetIndex(idx, js.ValueOf(val))\n")
-			}
+		if isByteArray(r) {
+			buf.WriteString(fmt.Sprintf("\t\tif %s != nil {\n", varName))
+			buf.WriteString(fmt.Sprintf("\t\t\tuint8Array := js.Global().Get(\"Uint8Array\").New(len(%s))\n", varName))
+			buf.WriteString(fmt.Sprintf("\t\t\tjs.CopyBytesToJS(uint8Array, %s)\n", varName))
+			buf.WriteString("\t\t\treturn uint8Array\n")
+			buf.WriteString("\t\t}\n")
+			buf.WriteString("\t\treturn js.Null()\n")
 		} else {
-			if r.EltIsPtr {
-				buf.WriteString("\t\t\t\tif val != nil {\n")
-				buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, val.ToJSValue())\n")
-				buf.WriteString("\t\t\t\t} else {\n")
-				buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, js.Null())\n")
-				buf.WriteString("\t\t\t\t}\n")
+			buf.WriteString(fmt.Sprintf("\t\tif %s != nil {\n", varName))
+			buf.WriteString(fmt.Sprintf("\t\t\tarrRes := js.Global().Get(\"Array\").New(len(%s))\n", varName))
+			buf.WriteString(fmt.Sprintf("\t\t\tfor idx, val := range %s {\n", varName))
+			if r.EltIsBasic {
+				if r.EltIsPtr {
+					buf.WriteString("\t\t\t\tif val != nil {\n")
+					buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, js.ValueOf(*val))\n")
+					buf.WriteString("\t\t\t\t} else {\n")
+					buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, js.Null())\n")
+					buf.WriteString("\t\t\t\t}\n")
+				} else {
+					buf.WriteString("\t\t\t\tarrRes.SetIndex(idx, js.ValueOf(val))\n")
+				}
 			} else {
-				buf.WriteString("\t\t\t\tarrRes.SetIndex(idx, val.ToJSValue())\n")
+				if r.EltIsPtr {
+					buf.WriteString("\t\t\t\tif val != nil {\n")
+					buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, val.ToJSValue())\n")
+					buf.WriteString("\t\t\t\t} else {\n")
+					buf.WriteString("\t\t\t\t\tarrRes.SetIndex(idx, js.Null())\n")
+					buf.WriteString("\t\t\t\t}\n")
+				} else {
+					buf.WriteString("\t\t\t\tarrRes.SetIndex(idx, val.ToJSValue())\n")
+				}
 			}
+			buf.WriteString("\t\t\t}\n")
+			buf.WriteString("\t\t\treturn arrRes\n")
+			buf.WriteString("\t\t}\n")
+			buf.WriteString("\t\treturn js.Null()\n")
 		}
-		buf.WriteString("\t\t\t}\n")
-		buf.WriteString("\t\t\treturn arrRes\n")
-		buf.WriteString("\t\t}\n")
-		buf.WriteString("\t\treturn js.Null()\n")
 	case KindMap:
 		buf.WriteString(fmt.Sprintf("\t\tif %s != nil {\n", varName))
 		buf.WriteString("\t\t\tmapRes := js.Global().Get(\"Object\").New()\n")
@@ -1056,12 +1138,25 @@ func generateGoToJSReturnValue(varName string, r FieldInfo) string {
 	return buf.String()
 }
 
+func generateGoToJSAsyncResolve(varName string, r FieldInfo) string {
+	raw := generateGoToJSReturnValue(varName, r)
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "return ") {
+			indent := line[:len(line)-len(trimmed)]
+			val := trimmed[7:]
+			lines[i] = fmt.Sprintf("%sresolve.Invoke(%s)", indent, val)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 func generateJSCode(structNames []string, structs map[string]*StructInfo, exportedFuncs []ExportedFunc) string {
 	var buf bytes.Buffer
 
 	buf.WriteString("// Code generated by wago; DO NOT EDIT.\n\n")
 
-	// Class declarations
 	for _, tName := range structNames {
 		st := structs[tName]
 		buf.WriteString("/**\n")
@@ -1127,7 +1222,6 @@ func generateJSCode(structNames []string, structs map[string]*StructInfo, export
 		buf.WriteString("}\n\n")
 	}
 
-	// Function wrappers
 	for _, fn := range exportedFuncs {
 		// JSDoc
 		buf.WriteString("/**\n")
@@ -1142,9 +1236,17 @@ func generateJSCode(structNames []string, structs map[string]*StructInfo, export
 					retType = "void"
 				}
 			}
-			buf.WriteString(fmt.Sprintf(" * @returns {%s}\n", retType))
+			if fn.IsAsync {
+				buf.WriteString(fmt.Sprintf(" * @returns {Promise.<%s>}\n", retType))
+			} else {
+				buf.WriteString(fmt.Sprintf(" * @returns {%s}\n", retType))
+			}
 		} else {
-			buf.WriteString(" * @returns {void}\n")
+			if fn.IsAsync {
+				buf.WriteString(" * @returns {Promise.<void>}\n")
+			} else {
+				buf.WriteString(" * @returns {void}\n")
+			}
 		}
 		buf.WriteString(" */\n")
 
@@ -1153,7 +1255,13 @@ func generateJSCode(structNames []string, structs map[string]*StructInfo, export
 		for _, p := range fn.Params {
 			paramNames = append(paramNames, p.GoName)
 		}
-		buf.WriteString(fmt.Sprintf("export function %s(%s) {\n", fn.JSName, strings.Join(paramNames, ", ")))
+		asyncPrefix := ""
+		awaitPrefix := ""
+		if fn.IsAsync {
+			asyncPrefix = "async "
+			awaitPrefix = "await "
+		}
+		buf.WriteString(fmt.Sprintf("export %sfunction %s(%s) {\n", asyncPrefix, fn.JSName, strings.Join(paramNames, ", ")))
 
 		// Convert arguments
 		var argCallNames []string
@@ -1163,14 +1271,10 @@ func generateJSCode(structNames []string, structs map[string]*StructInfo, export
 			case KindBasic:
 				buf.WriteString(fmt.Sprintf("\tconst %s = %s;\n", rawName, p.GoName))
 			case KindStruct:
-				if p.IsPointer {
-					buf.WriteString(fmt.Sprintf("\tconst %s = %s ? %s.toJS() : null;\n", rawName, p.GoName, p.GoName))
-				} else {
-					buf.WriteString(fmt.Sprintf("\tconst %s = %s ? %s.toJS() : null;\n", rawName, p.GoName, p.GoName))
-				}
+				buf.WriteString(fmt.Sprintf("\tconst %s = %s ? %s.toJS() : null;\n", rawName, p.GoName, p.GoName))
 			case KindSlice:
-				if p.EltIsBasic {
-					buf.WriteString(fmt.Sprintf("\tconst %s = %s || [];\n", rawName, p.GoName))
+				if isByteArray(p) {
+					buf.WriteString(fmt.Sprintf("\tconst %s = %s || null;\n", rawName, p.GoName))
 				} else {
 					buf.WriteString(fmt.Sprintf("\tconst %s = %s ? %s.map(item => item ? item.toJS() : null) : [];\n", rawName, p.GoName, p.GoName))
 				}
@@ -1185,7 +1289,7 @@ func generateJSCode(structNames []string, structs map[string]*StructInfo, export
 		}
 
 		// Call global function
-		callExpr := fmt.Sprintf("globalThis.%s(%s)", fn.JSName, strings.Join(argCallNames, ", "))
+		callExpr := fmt.Sprintf("%sglobalThis.%s(%s)", awaitPrefix, fn.JSName, strings.Join(argCallNames, ", "))
 		buf.WriteString(fmt.Sprintf("\tconst res = %s;\n", callExpr))
 
 		// Check error
@@ -1239,20 +1343,24 @@ func getJSDocType(f FieldInfo) string {
 	case KindStruct:
 		base = f.BaseType
 	case KindSlice:
-		var elt string
-		if f.EltIsBasic {
-			switch f.BaseType {
-			case "string":
-				elt = "string"
-			case "bool":
-				elt = "boolean"
-			default:
-				elt = "number"
-			}
+		if isByteArray(f) {
+			base = "Uint8Array"
 		} else {
-			elt = f.BaseType
+			var elt string
+			if f.EltIsBasic {
+				switch f.BaseType {
+				case "string":
+					elt = "string"
+				case "bool":
+					elt = "boolean"
+				default:
+					elt = "number"
+				}
+			} else {
+				elt = f.BaseType
+			}
+			base = fmt.Sprintf("Array.<%s>", elt)
 		}
-		base = fmt.Sprintf("Array.<%s>", elt)
 	case KindMap:
 		var elt string
 		if f.EltIsBasic {
@@ -1283,6 +1391,9 @@ func generateJSFromJSConv(varName string, f FieldInfo) string {
 	case KindStruct:
 		return fmt.Sprintf("%s.fromJS(%s)", f.BaseType, varName)
 	case KindSlice:
+		if isByteArray(f) {
+			return varName
+		}
 		if f.EltIsBasic {
 			return fmt.Sprintf("%s || []", varName)
 		}
@@ -1307,6 +1418,9 @@ func generateJSToJSConv(varName string, f FieldInfo) string {
 		}
 		return fmt.Sprintf("%s.toJS()", varName)
 	case KindSlice:
+		if isByteArray(f) {
+			return varName
+		}
 		if f.EltIsBasic {
 			return varName
 		}
@@ -1327,7 +1441,7 @@ func generateGoConv(varName, baseType string) string {
 		return fmt.Sprintf("%s.String()", varName)
 	case "bool":
 		return fmt.Sprintf("%s.Bool()", varName)
-	case "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+	case "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "byte", "rune":
 		return fmt.Sprintf("%s(%s.Int())", baseType, varName)
 	case "float32", "float64":
 		return fmt.Sprintf("%s(%s.Float())", baseType, varName)
