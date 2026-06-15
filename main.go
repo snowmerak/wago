@@ -568,7 +568,7 @@ func generateGoCode(pkgName string, types []string, structs map[string]*StructIn
 				}
 			case KindSlice:
 				buf.WriteString(fmt.Sprintf("\t\tu.%s = make(%s, temp.Length())\n", f.GoName, f.GoType))
-				buf.WriteString(fmt.Sprintf("\t\tfor i := 0; i < temp.Length(); i++ {\n"))
+				fmt.Fprintf(&buf, "\t\tfor i := 0; i < temp.Length(); i++ {\n")
 				buf.WriteString("\t\t\titem := temp.Index(i)\n")
 				buf.WriteString("\t\t\tif !item.IsUndefined() && !item.IsNull() {\n")
 				if f.EltIsBasic {
